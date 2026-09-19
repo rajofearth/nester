@@ -12,13 +12,6 @@ data class MediaItem(
 
 data class BackupPlanItem(val item: MediaItem, val remotePath: String)
 
-data class BackupRun(
-    val totalFiles: Int,
-    val doneFiles: Int,
-    val sentBytes: Long,
-    val totalBytes: Long,
-)
-
 fun sanitizeName(name: String): String = name.replace(Regex("[/\\\\\\u0000]"), "_")
 
 fun buildRemotePath(relativeDir: String, displayName: String): String =

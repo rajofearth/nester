@@ -1,15 +1,18 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod theme;
+mod tray;
 mod ui;
 mod win;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use clap::Parser;
@@ -47,6 +50,9 @@ pub struct HostRuntime {
     pub folders: Mutex<Vec<Folder>>,
     pub last_scan: Mutex<Option<ui::ScanLog>>,
     pub pending_restart: AtomicBool,
+    pub crashed_last_run: bool,
+    pub devices: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    pub events: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl HostRuntime {
@@ -65,16 +71,16 @@ impl HostRuntime {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nester=info,nester_server=info".into()),
-        )
-        .init();
+    single_instance();
 
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(data_dir.join("index"))?;
+    std::fs::create_dir_all(data_dir.join("logs"))?;
+    install_panic_hook(&data_dir);
+    let _log_guard = init_logging(&data_dir);
+
+    let crashed_last_run = take_crash_note(&data_dir);
     let config_path = Config::data_path(&data_dir);
     let mut config = Config::load(&config_path).unwrap_or_default();
     let port = args
@@ -128,6 +134,8 @@ fn main() -> anyhow::Result<()> {
         .collect();
     config.save(&config_path)?;
 
+    let devices: Arc<Mutex<HashMap<IpAddr, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    let events: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let runtime = Arc::new(HostRuntime {
         ip: local_ip(),
         port,
@@ -137,6 +145,9 @@ fn main() -> anyhow::Result<()> {
         folders: Mutex::new(folders.clone()),
         last_scan: Mutex::new(None),
         pending_restart: AtomicBool::new(false),
+        crashed_last_run,
+        devices: devices.clone(),
+        events: events.clone(),
     });
 
     let server_runtime = Arc::clone(&runtime);
@@ -151,7 +162,8 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             rt.block_on(async move {
                 let watchers = start_rescans(&server_runtime, &server_folders, &server_dbs)?;
-                let state = AppState::new(server_folders, server_dbs, server_token);
+                let state =
+                    AppState::new(server_folders, server_dbs, server_token, devices, events);
                 let addr = SocketAddr::from(([0, 0, 0, 0], port));
                 let listener = tokio::net::TcpListener::bind(addr).await?;
                 tracing::info!("serving on {addr}");
@@ -171,8 +183,23 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let (tray_tx, tray_rx) = std::sync::mpsc::channel::<tray::UiMessage>();
+    let _tray = tray::TrayController::spawn(tray_tx);
+
     gpui_platform::application().run(move |cx: &mut gpui::App| {
-        ui::HostWindow::open(cx, runtime.clone());
+        let handle = ui::HostWindow::open(cx, runtime.clone(), tray_rx);
+        handle
+            .update(cx, |_, window, cx| {
+                window.on_window_should_close(cx, move |_, _| {
+                    if let Some(hwnd) = win::find_hwnd() {
+                        win::hide(hwnd);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            })
+            .ok();
     });
 
     Ok(())
@@ -208,17 +235,42 @@ fn start_rescans(
         let db = dbs[&folder.id].clone();
         let runtime = Arc::clone(runtime);
         tokio::task::spawn_blocking(move || {
+            let mut last_scan_at: Option<Instant> = None;
             while rx.recv().is_ok() {
                 while rx.try_recv().is_ok() {}
+                // Quiet window: phone uploads and editors both burst; one scan
+                // after things settle beats a scan per write.
+                std::thread::sleep(Duration::from_secs(3));
+                while rx.try_recv().is_ok() {}
+                if let Some(t) = last_scan_at {
+                    let since = t.elapsed();
+                    if since < Duration::from_secs(2) {
+                        std::thread::sleep(Duration::from_secs(2) - since);
+                    }
+                }
+                last_scan_at = Some(Instant::now());
                 let mut conn = db.lock().unwrap();
                 match nester_core::scan::scan_folder(&mut conn, &root) {
                     Ok(stats) => {
-                        tracing::info!(
-                            "rescan {label}: {} added, {} updated, {} removed",
-                            stats.added,
-                            stats.updated,
-                            stats.removed
-                        );
+                        if stats.added + stats.updated + stats.removed > 0 {
+                            tracing::info!(
+                                "rescan {label}: {} added, {} updated, {} removed",
+                                stats.added,
+                                stats.updated,
+                                stats.removed
+                            );
+                            let text = format!(
+                                "{label}: +{} changed {} removed {}",
+                                stats.added, stats.updated, stats.removed
+                            );
+                            {
+                                let mut log = runtime.events.lock().unwrap();
+                                log.push_back(text);
+                                while log.len() > 40 {
+                                    log.pop_front();
+                                }
+                            }
+                        }
                         *runtime.last_scan.lock().unwrap() = Some(ui::ScanLog {
                             label: label.clone(),
                             stats,
@@ -230,6 +282,82 @@ fn start_rescans(
         });
     }
     Ok(watchers)
+}
+
+fn single_instance() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let name: Vec<u16> = "Local\\nester-singleton\0".encode_utf16().collect();
+        let _mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            std::process::exit(0);
+        }
+    }
+}
+
+fn init_logging(data_dir: &Path) -> tracing_appender::non_blocking::WorkerGuard {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "nester=info,nester_server=info".into());
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("nester")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(data_dir.join("logs"))
+        .expect("failed to create rolling log appender");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_filter(filter.clone());
+    #[cfg(debug_assertions)]
+    let subscriber = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(tracing_subscriber::fmt::layer().with_filter(filter));
+    #[cfg(not(debug_assertions))]
+    let subscriber = tracing_subscriber::registry().with(file_layer);
+    subscriber.init();
+    guard
+}
+
+fn install_panic_hook(data_dir: &Path) {
+    let path = data_dir.join("crash.log");
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let ts = unix_ts();
+        let report = format!(
+            "nester v{} crashed at {ts} (unix)\n{info}\n\n{backtrace}\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let _ = std::fs::write(&path, report);
+        default_hook(info);
+    }));
+}
+
+/// A leftover crash.log means the previous run died uncleanly; file it away
+/// with a timestamp and flag it so the UI can show the crash banner.
+fn take_crash_note(data_dir: &Path) -> bool {
+    let path = data_dir.join("crash.log");
+    if !path.exists() {
+        return false;
+    }
+    let _ = std::fs::rename(&path, data_dir.join(format!("crash-{}.log", unix_ts())));
+    true
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn default_data_dir() -> std::path::PathBuf {

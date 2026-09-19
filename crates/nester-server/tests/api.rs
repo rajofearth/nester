@@ -13,7 +13,7 @@ mod tests {
     use nester_server::state::AppState;
     use nester_server::{openapi_json, router};
 
-    fn test_router() -> Router {
+    fn test_router_with_dir() -> (Router, std::path::PathBuf) {
         let dir = nester_core::test_root("server-api");
         let db = dir
             .parent()
@@ -29,7 +29,20 @@ mod tests {
         };
         let mut dbs = HashMap::new();
         dbs.insert("pics".to_string(), Arc::new(Mutex::new(conn)));
-        router(AppState::new(vec![folder], dbs, "tok123".into()))
+        (
+            router(AppState::new(
+                vec![folder],
+                dbs,
+                "tok123".into(),
+                Default::default(),
+                Default::default(),
+            )),
+            dir,
+        )
+    }
+
+    fn test_router() -> Router {
+        test_router_with_dir().0
     }
 
     #[tokio::test]
@@ -115,6 +128,148 @@ mod tests {
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
         let body = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn download_serves_indexed_mtime_headers() {
+        let r = test_router();
+        let res = r
+            .clone()
+            .oneshot(
+                Request::get("/api/folders/pics/entries?since=0")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<nester_core::FileEntry> = serde_json::from_slice(&body).unwrap();
+        let a = entries.iter().find(|e| e.path == "a.txt").unwrap();
+
+        let res = r
+            .oneshot(
+                Request::get("/api/folders/pics/files/a.txt")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let s = res
+            .headers()
+            .get("X-Nester-Mtime-S")
+            .expect("mtime s header")
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let ns = res
+            .headers()
+            .get("X-Nester-Mtime-Ns")
+            .expect("mtime ns header")
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert_eq!(s, a.mtime_s);
+        assert_eq!(ns, a.mtime_ns);
+    }
+
+    #[tokio::test]
+    async fn download_omits_mtime_headers_without_index_row() {
+        let (r, dir) = test_router_with_dir();
+        std::fs::write(dir.join("unindexed.txt"), b"new on disk").unwrap();
+        let res = r
+            .oneshot(
+                Request::get("/api/folders/pics/files/unindexed.txt")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("X-Nester-Mtime-S").is_none());
+        assert!(res.headers().get("X-Nester-Mtime-Ns").is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_windows_unsafe_names() {
+        let r = test_router();
+        let cases = [
+            "/api/folders/pics/files/bad%3Aname.txt",
+            "/api/folders/pics/files/name%20",
+        ];
+        for case in cases {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::post(case)
+                        .header(header::AUTHORIZATION, "Bearer tok123")
+                        .body(Body::from(b"x".to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "case: {case}");
+        }
+        let res = r
+            .oneshot(
+                Request::post("/api/folders/pics/files/ok%20name.txt")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .header("X-Nester-Mtime-S", "2000")
+                    .body(Body::from(b"fine".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn download_rejects_windows_unsafe_names() {
+        let r = test_router();
+        let res = r
+            .oneshot(
+                Request::get("/api/folders/pics/files/bad%3Aname.txt")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn entries_since_stale_cursor_conflicts() {
+        let r = test_router();
+        let res = r
+            .clone()
+            .oneshot(
+                Request::get("/api/folders/pics/entries?since=999999")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"index-reset");
+
+        let res = r
+            .oneshot(
+                Request::get("/api/folders/pics/entries?since=99999999")
+                    .header(header::AUTHORIZATION, "Bearer tok123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 
     #[test]

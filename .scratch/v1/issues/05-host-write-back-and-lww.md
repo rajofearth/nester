@@ -14,4 +14,4 @@ What done looks like:
 
 Acceptance criteria: two versions of the same path pushed while apart converge to the newer one, with the sequence advancing so the other device pulls the result.
 
-Notes: records the deliberate LWW deviation from the product context report.
+Notes: records the deliberate LWW deviation from the product context report. Follow-up (log-only today): uploads whose name differs only by ASCII case from an existing entry in the same parent are logged as a warning; Windows keeps host casing on rename, so the phone mirror can hold two entries until the next delta pull. A dedupe or keep-both policy belongs with the v2 conflict work.

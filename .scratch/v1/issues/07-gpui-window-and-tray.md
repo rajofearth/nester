@@ -1,7 +1,9 @@
 # 07: GPUI window and tray
 
-Status: in-progress
+Status: done
 Blocked-by: none
+
+Window + tray + host app shell complete: card-style window (QR, folders with add/remove + restart hint, devices with last-seen dots, activity feed, crash banner, run-at-login toggle), tray icon (runtime-drawn) with Open/Quit, close-to-tray, single-instance mutex, file logging (daily rolling, 7 files), panic hook + next-launch crash banner, release build hides console.
 
 Host window (GPUI) matching the opencode-monitor-utility design language: palette, rounded card, blurred background. Window done; tray-icon deferred.
 

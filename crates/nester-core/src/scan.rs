@@ -73,10 +73,12 @@ pub fn scan_folder(conn: &mut Connection, root: &Path) -> anyhow::Result<ScanSta
             && !known.deleted
             && known.kind == EntryKind::File
             && known.size == meta.len()
-            && known.mtime_s == mtime_s
-            && known.mtime_ns == mtime_ns
             && known.hash.is_some()
+            && known.mtime_s.abs_diff(mtime_s) <= 2
         {
+            // FAT-style 2s tolerance: sub-2s mtime wobble (and any ns jitter
+            // inside the window) counts as unchanged so FAT-touched files do
+            // not rehash forever. Sizes and hashes still gate everything.
             stats.unchanged += 1;
             continue;
         }
@@ -198,6 +200,15 @@ pub fn entries_since(conn: &Connection, since: i64) -> anyhow::Result<Vec<FileEn
     )?;
     let rows = stmt.query_map([since], row_to_entry)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Highest sequence number handed out so far, 0 for an empty index.
+pub fn max_sequence(conn: &Connection) -> anyhow::Result<i64> {
+    Ok(
+        conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM files", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Index lookup by relative path.
@@ -341,5 +352,44 @@ mod tests {
             a.hash.as_deref(),
             Some(blake3::hash(b"v2-longer").to_hex().as_str())
         );
+    }
+
+    #[test]
+    fn mtime_within_two_seconds_unchanged() {
+        use std::time::Duration;
+
+        let root = crate::test_root("scan-fat-window");
+        let db = root.parent().unwrap().join(format!(
+            "{}.db",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        let p = root.join("a.txt");
+        std::fs::write(&p, b"same").unwrap();
+        let mut conn = open_db(&db).unwrap();
+        scan_folder(&mut conn, &root).unwrap();
+        let base = get_entry(&conn, "a.txt").unwrap().unwrap().mtime_s;
+
+        let set_mtime = |s: i64| {
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(s.max(0) as u64)),
+            )
+            .unwrap();
+        };
+
+        // +1s, same content: inside the window, no rehash.
+        set_mtime(base + 1);
+        let stats = scan_folder(&mut conn, &root).unwrap();
+        assert_eq!(stats.unchanged, 1);
+        assert_eq!(stats.updated, 0);
+
+        // +3s, same content: outside the window, rehash fires (same hash, new
+        // mtime lands in the index).
+        set_mtime(base + 3);
+        let stats = scan_folder(&mut conn, &root).unwrap();
+        assert_eq!(stats.updated, 1);
+        let a = get_entry(&conn, "a.txt").unwrap().unwrap();
+        assert_eq!(a.mtime_s, base + 3);
     }
 }

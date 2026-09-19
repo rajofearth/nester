@@ -35,6 +35,7 @@ dependencies {
   implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.4")
   implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.4")
   implementation("androidx.compose.material3:material3")
+  implementation("androidx.compose.material:material-icons-core")
   implementation("androidx.compose.ui:ui")
   implementation("androidx.compose.ui:ui-tooling-preview")
   implementation("androidx.core:core-ktx:1.17.0")

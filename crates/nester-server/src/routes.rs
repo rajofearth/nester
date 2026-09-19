@@ -19,9 +19,76 @@ pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
 }
 
+#[derive(serde::Serialize, utoipa::ToSchema, Clone)]
+pub struct FolderStats {
+    pub files: u64,
+    pub bytes: u64,
+    pub last_change_at: Option<i64>,
+    pub last_change_path: Option<String>,
+    pub state: String,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct FolderWithStats {
+    #[serde(flatten)]
+    pub folder: Folder,
+    pub stats: Option<FolderStats>,
+}
+
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct FoldersResponse {
-    pub folders: Vec<Folder>,
+    pub folders: Vec<FolderWithStats>,
+}
+
+/// Per-folder rollup straight from the index: totals for the GUI and the phone
+/// header, plus a syncing flag while a transfer landed recently.
+fn folder_stats(state: &AppState, folder_id: &str) -> Option<FolderStats> {
+    let db = state.db(folder_id)?;
+    let (files, bytes, last_path, last_at) = {
+        let conn = db.lock().unwrap();
+        let files: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE deleted = 0 AND kind = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let bytes: u64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM files WHERE deleted = 0 AND kind = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let last = conn
+            .query_row(
+                "SELECT path, mtime_s FROM files WHERE deleted = 0 AND kind = 0
+                 ORDER BY sequence DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        (
+            files,
+            bytes,
+            last.as_ref().map(|t| t.0.clone()),
+            last.as_ref().map(|t| t.1),
+        )
+    };
+    let state_value = {
+        let live = state.live.lock().unwrap();
+        match live.get(folder_id) {
+            Some(until) if *until > std::time::Instant::now() => "syncing".to_string(),
+            _ => "idle".to_string(),
+        }
+    };
+    Some(FolderStats {
+        files,
+        bytes,
+        last_change_at: last_at,
+        last_change_path: last_path,
+        state: state_value,
+    })
 }
 
 #[utoipa::path(
@@ -31,9 +98,26 @@ pub struct FoldersResponse {
     security(("pairing_token" = []))
 )]
 pub async fn list_folders(State(state): State<AppState>) -> Json<FoldersResponse> {
-    Json(FoldersResponse {
-        folders: state.folders.as_ref().clone(),
-    })
+    let folders = state
+        .folders
+        .iter()
+        .map(|f| FolderWithStats {
+            folder: f.clone(),
+            stats: folder_stats(&state, &f.id),
+        })
+        .collect();
+    Json(FoldersResponse { folders })
+}
+
+/// The phone pings this while foregrounded so the host shows it as online.
+#[utoipa::path(
+    post,
+    path = "/api/heartbeat",
+    responses((status = 204)),
+    security(("pairing_token" = []))
+)]
+pub async fn heartbeat() -> impl IntoResponse {
+    StatusCode::NO_CONTENT
 }
 
 #[derive(serde::Deserialize, utoipa::IntoParams)]
@@ -45,7 +129,10 @@ pub struct EntriesQuery {
     get,
     path = "/api/folders/{folder_id}/entries",
     params(("folder_id" = String, Path), EntriesQuery),
-    responses((status = 200, body = Vec<FileEntry>)),
+    responses(
+        (status = 200, body = Vec<FileEntry>),
+        (status = 409, description = "index-reset: the cursor is past the current max sequence, re-pull from 0"),
+    ),
     security(("pairing_token" = []))
 )]
 pub async fn list_entries(
@@ -59,11 +146,16 @@ pub async fn list_entries(
     let since = q.since.unwrap_or(0);
     let result = tokio::task::spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        nester_core::scan::entries_since(&conn, since)
+        let max = nester_core::scan::max_sequence(&conn)?;
+        if since > max {
+            return Ok(None);
+        }
+        nester_core::scan::entries_since(&conn, since).map(Some)
     })
     .await;
     match result {
-        Ok(Ok(entries)) => Json(entries).into_response(),
+        Ok(Ok(Some(entries))) => Json(entries).into_response(),
+        Ok(Ok(None)) => (StatusCode::CONFLICT, "index-reset").into_response(),
         Ok(Err(e)) => {
             tracing::error!("entries query failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "index error").into_response()
@@ -91,6 +183,9 @@ pub async fn download(
         return (StatusCode::NOT_FOUND, "unknown folder").into_response();
     };
     let rel_path = decode_rel(&rel_path);
+    if !valid_rel_path(&rel_path) {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
     let Some(full) = safe_join(&root, &rel_path) else {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     };
@@ -100,6 +195,7 @@ pub async fn download(
     if !meta.is_file() {
         return (StatusCode::NOT_FOUND, "not a file").into_response();
     }
+    let indexed_mtime = indexed_mtime(&state, &folder_id, &rel_path).await;
     let len = meta.len();
     let mime = mime_for(&rel_path);
 
@@ -111,7 +207,7 @@ pub async fn download(
         }
     };
 
-    match parse_range(headers.get(header::RANGE), len) {
+    let mut resp: Response = match parse_range(headers.get(header::RANGE), len) {
         Some(Err(())) => (
             StatusCode::RANGE_NOT_SATISFIABLE,
             [(header::CONTENT_RANGE, format!("bytes */{len}"))],
@@ -146,7 +242,34 @@ pub async fn download(
             )
                 .into_response()
         }
+    };
+    if let Some((s, ns)) = indexed_mtime {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&s.to_string()) {
+            resp.headers_mut().insert("X-Nester-Mtime-S", v);
+        }
+        if let Ok(v) = axum::http::HeaderValue::from_str(&ns.to_string()) {
+            resp.headers_mut().insert("X-Nester-Mtime-Ns", v);
+        }
     }
+    resp
+}
+
+/// The indexed mtime of `rel_path`, for download mtime-fidelity headers.
+/// Missing/deleted/dir rows yield None so the caller omits the headers.
+async fn indexed_mtime(state: &AppState, folder_id: &str, rel_path: &str) -> Option<(i64, i64)> {
+    let db = state.db(folder_id)?;
+    let rel = rel_path.to_string();
+    let entry = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        nester_core::scan::get_entry(&conn, &rel).ok().flatten()
+    })
+    .await
+    .ok()
+    .flatten()?;
+    if entry.deleted || entry.kind != EntryKind::File {
+        return None;
+    }
+    Some((entry.mtime_s, entry.mtime_ns))
 }
 
 /// Single byte range only. `Ok((start, end))` inclusive; `Err(())` unsatisfiable;
@@ -195,6 +318,69 @@ pub fn safe_join(root: &std::path::Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
+/// Windows-host guard over the DECODED relative path: names must survive
+/// landing on NTFS/Win32. Rejects reserved chars, control chars, dot/space
+/// endings, empty segments, and oversized paths. Runs before `safe_join`, on
+/// every handler that takes a file path.
+fn valid_rel_path(rel: &str) -> bool {
+    if rel.len() > 240 {
+        return false;
+    }
+    rel.split('/').all(|seg| {
+        !seg.is_empty()
+            && !seg.ends_with('.')
+            && !seg.ends_with(' ')
+            && !seg.bytes().any(|b| b < 0x20 || b == 0x7f)
+            && !seg.contains(['<', '>', ':', '"', '|', '?', '*'])
+    })
+}
+
+/// Log-only: flag uploads whose name collides with an existing entry that
+/// differs only by ASCII case in the same parent directory. Windows keeps the
+/// host's casing on rename, so the disk file is authoritative; the phone's
+/// mirror may briefly hold two entries until the next delta pull. No
+/// user-facing behavior yet.
+fn warn_case_collision(conn: &rusqlite::Connection, rel: &str) {
+    let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let prefix = format!("{parent}/");
+    let mut stmt = match conn.prepare("SELECT path FROM files WHERE deleted = 0") {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("case-collision probe skipped: {e}");
+            return;
+        }
+    };
+    let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!("case-collision probe skipped: {e}");
+            return;
+        }
+    };
+    for row in rows.flatten() {
+        if row == rel {
+            continue;
+        }
+        let other_name = if parent.is_empty() {
+            if row.contains('/') {
+                continue;
+            }
+            row.as_str()
+        } else {
+            match row.strip_prefix(prefix.as_str()) {
+                Some(rest) if !rest.contains('/') => rest,
+                _ => continue,
+            }
+        };
+        if other_name.eq_ignore_ascii_case(name) {
+            tracing::warn!(
+                "case-collision on upload: '{rel}' differs only by case from existing '{row}'"
+            );
+            return;
+        }
+    }
+}
+
 fn mime_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
@@ -221,6 +407,7 @@ pub fn public_routes(state: AppState) -> Router {
 pub fn protected_routes(state: AppState) -> Router {
     Router::new()
         .route("/api/folders", get(list_folders))
+        .route("/api/heartbeat", post(heartbeat))
         .route("/api/folders/{folder_id}/entries", get(list_entries))
         .route("/api/folders/{folder_id}/files/{*path}", get(download))
         .route("/api/folders/{folder_id}/files/{*path}", post(upload))
@@ -257,6 +444,9 @@ pub async fn upload(
         return (StatusCode::NOT_FOUND, "unknown folder").into_response();
     };
     let rel_path = decode_rel(&rel_path);
+    if !valid_rel_path(&rel_path) {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
     let Some(full) = safe_join(&root, &rel_path) else {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     };
@@ -361,9 +551,11 @@ pub async fn upload(
 
     let db = state.db(&folder_id).unwrap();
     let dirs = collect_missing_dirs(&rel_path);
+    let event_path = rel_path.clone();
     let rel = rel_path;
     let result = tokio::task::spawn_blocking(move || {
         let mut conn = db.lock().unwrap();
+        warn_case_collision(&conn, &rel);
         for dir in dirs {
             let _ = nester_core::scan::apply_file_change(
                 &mut conn,
@@ -396,7 +588,18 @@ pub async fn upload(
     .await;
 
     match result {
-        Ok(Ok(())) => (StatusCode::CREATED, "stored").into_response(),
+        Ok(Ok(())) => {
+            state.mark_syncing(&folder_id, 6);
+            state.note_event(format!(
+                "{}: received {} ({} bytes)",
+                state
+                    .folder_label(&folder_id)
+                    .unwrap_or_else(|| folder_id.clone()),
+                event_path,
+                size
+            ));
+            (StatusCode::CREATED, "stored").into_response()
+        }
         Ok(Err(e)) => {
             tracing::error!("index update failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "index failed").into_response()
@@ -428,10 +631,14 @@ pub async fn delete_file(
         return (StatusCode::NOT_FOUND, "unknown folder").into_response();
     };
     let rel_path = decode_rel(&rel_path);
+    if !valid_rel_path(&rel_path) {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
     let Some(full) = safe_join(&root, &rel_path) else {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     };
     let _ = tokio::fs::remove_file(&full).await;
+    let event_path = rel_path.clone();
     let rel = rel_path;
     let result = tokio::task::spawn_blocking(move || {
         let mut conn = db.lock().unwrap();
@@ -439,7 +646,17 @@ pub async fn delete_file(
     })
     .await;
     match result {
-        Ok(Ok(_)) => (StatusCode::OK, "deleted").into_response(),
+        Ok(Ok(_)) => {
+            state.mark_syncing(&folder_id, 6);
+            state.note_event(format!(
+                "{}: deleted {}",
+                state
+                    .folder_label(&folder_id)
+                    .unwrap_or_else(|| folder_id.clone()),
+                event_path
+            ));
+            (StatusCode::OK, "deleted").into_response()
+        }
         Ok(Err(e)) => {
             tracing::error!("delete index failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "index failed").into_response()

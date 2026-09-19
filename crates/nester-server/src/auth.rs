@@ -1,4 +1,6 @@
-use axum::extract::State;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -23,6 +25,9 @@ pub async fn require_bearer(
 
     let ok = provided.as_bytes().ct_eq(state.pairing_token.as_bytes());
     if bool::from(ok) {
+        if let Some(ConnectInfo(addr)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+            state.touch_device(addr.ip());
+        }
         next.run(request).await
     } else {
         unauthorized()

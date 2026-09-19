@@ -1,7 +1,8 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, FocusHandle, Render, SharedString, Window,
@@ -11,6 +12,7 @@ use nester_core::scan::ScanStats;
 use qrcode::QrCode;
 
 use crate::theme::{self, Mode, Palette};
+use crate::tray::UiMessage;
 use crate::{HostRuntime, win};
 
 pub struct HostWindow {
@@ -18,6 +20,10 @@ pub struct HostWindow {
     mode: Mode,
     qr: Option<QrMatrix>,
     last_scan: Option<ScanLog>,
+    devices: Vec<(IpAddr, u64)>,
+    activity: Vec<String>,
+    #[cfg(windows)]
+    autostart: bool,
     focus: FocusHandle,
 }
 
@@ -34,7 +40,11 @@ pub struct ScanLog {
 }
 
 impl HostWindow {
-    pub fn open(cx: &mut App, runtime: Arc<HostRuntime>) -> gpui::WindowHandle<HostWindow> {
+    pub fn open(
+        cx: &mut App,
+        runtime: Arc<HostRuntime>,
+        tray_rx: Receiver<UiMessage>,
+    ) -> gpui::WindowHandle<HostWindow> {
         let mode = if win::system_is_dark() {
             Mode::Dark
         } else {
@@ -55,7 +65,13 @@ impl HostWindow {
                 is_resizable: false,
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| Self::new(runtime, mode, cx)),
+            |_, cx| {
+                cx.new(|cx| {
+                    let mut window = Self::new(runtime, mode, cx);
+                    window.start_pump(tray_rx, cx);
+                    window
+                })
+            },
         )
         .expect("failed to open nester window")
     }
@@ -69,7 +85,15 @@ impl HostWindow {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
                 let log = poll_runtime.last_scan.lock().unwrap().clone();
-                if this.update(cx, |this, _| this.last_scan = log).is_err() {
+                let (device_list, activity) = poll_runtime.ui_snapshots();
+                if this
+                    .update(cx, |this, _| {
+                        this.last_scan = log;
+                        this.devices = device_list;
+                        this.activity = activity;
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -81,12 +105,78 @@ impl HostWindow {
             mode,
             qr,
             last_scan,
+            devices: Vec::new(),
+            activity: Vec::new(),
+            #[cfg(windows)]
+            autostart: win::autostart_enabled(),
             focus: cx.focus_handle(),
+        }
+    }
+
+    fn start_pump(&mut self, rx: Receiver<UiMessage>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                while let Ok(msg) = rx.try_recv() {
+                    if this.update(cx, |this, cx| this.handle_ui(msg, cx)).is_err() {
+                        return;
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn handle_ui(&mut self, msg: UiMessage, _cx: &mut Context<Self>) {
+        match msg {
+            UiMessage::ToggleWindow => {
+                if let Some(hwnd) = win::find_hwnd() {
+                    if win::is_visible() {
+                        win::hide(hwnd);
+                    } else {
+                        win::show(hwnd);
+                    }
+                }
+            }
+            UiMessage::ShowWindow => {
+                if let Some(hwnd) = win::find_hwnd() {
+                    win::show(hwnd);
+                }
+            }
+            UiMessage::Quit => {
+                tracing::info!("shutdown requested from tray menu");
+                std::process::exit(0);
+            }
         }
     }
 }
 
 impl HostRuntime {
+    /// Snapshot for the UI poller: devices sorted newest-first + activity log.
+    pub fn ui_snapshots(&self) -> (Vec<(IpAddr, u64)>, Vec<String>) {
+        let now = Instant::now();
+        let mut device_list: Vec<(IpAddr, u64)> = self
+            .devices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ip, seen)| (*ip, now.duration_since(*seen).as_secs()))
+            .collect();
+        device_list.sort_by_key(|(_, ago)| *ago);
+        let activity: Vec<String> = self
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(8)
+            .cloned()
+            .collect();
+        (device_list, activity)
+    }
+
     fn folder_rows(&self) -> Vec<(String, String)> {
         self.folders
             .lock()
@@ -178,6 +268,7 @@ impl Render for HostWindow {
             .bg(p.card)
             .rounded(px(22.))
             .track_focus(&self.focus)
+            .children(self.runtime.crashed_last_run.then(|| crash_banner(&p)))
             .child(header(&p))
             .child(
                 div()
@@ -191,7 +282,9 @@ impl Render for HostWindow {
                     .gap(px(12.))
                     .pb(px(12.))
                     .child(pairing_section(&p, &self.runtime, qr.as_ref()))
-                    .children(folders_section(self, &p, cx)),
+                    .children(folders_section(self, &p, cx))
+                    .child(devices_section(&self.devices, &p))
+                    .child(activity_section(&self.activity, &p)),
             )
             .child(footer(self, &p))
     }
@@ -222,6 +315,123 @@ fn header(p: &Palette) -> Div {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child("LAN"),
         )
+}
+
+fn crash_banner(p: &Palette) -> Div {
+    div()
+        .rounded(px(9.))
+        .bg(p.warn)
+        .text_color(hsla(0.0, 0.0, 0.06, 1.0))
+        .px(px(12.))
+        .py(px(6.))
+        .text_size(px(11.5))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .child("nester didn't shut down cleanly last time - see logs")
+}
+
+fn devices_section(devices: &[(IpAddr, u64)], p: &Palette) -> Div {
+    let section = div().flex().flex_col().gap(px(8.)).pt(px(4.)).child(
+        div()
+            .text_size(px(14.))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child("Devices"),
+    );
+    let list = div()
+        .rounded(px(16.))
+        .bg(p.inner)
+        .px(px(14.))
+        .py(px(6.))
+        .flex()
+        .flex_col();
+    let list = if devices.is_empty() {
+        list.child(
+            div()
+                .py(px(7.))
+                .text_color(p.muted)
+                .text_size(px(12.5))
+                .child("No device connected yet - scan the QR from the Nester app."),
+        )
+    } else {
+        list.children(devices.iter().map(|(ip, ago)| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .py(px(7.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().size(px(7.)).rounded(px(3.5)).bg(if *ago < 60 {
+                            p.ok
+                        } else {
+                            p.warn
+                        }))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(format!("Device {ip}")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(p.muted)
+                        .text_size(px(11.))
+                        .child(if *ago < 5 {
+                            "seen just now".to_string()
+                        } else {
+                            format!("seen {} ago", plural_ago(*ago))
+                        }),
+                )
+        }))
+    };
+    section.child(list)
+}
+
+fn activity_section(activity: &[String], p: &Palette) -> Div {
+    let section = div().flex().flex_col().gap(px(8.)).pt(px(4.)).child(
+        div()
+            .text_size(px(14.))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child("Activity"),
+    );
+    let list = div()
+        .rounded(px(16.))
+        .bg(p.inner)
+        .px(px(14.))
+        .py(px(6.))
+        .flex()
+        .flex_col();
+    let list = if activity.is_empty() {
+        list.child(
+            div()
+                .py(px(7.))
+                .text_color(p.muted)
+                .text_size(px(12.5))
+                .child("Nothing yet. Changes in your folders and phone uploads show up here."),
+        )
+    } else {
+        list.children(activity.iter().map(|line| {
+            div()
+                .py(px(5.))
+                .text_size(px(12.))
+                .text_color(p.muted)
+                .child(line.clone())
+        }))
+    };
+    section.child(list)
+}
+
+fn plural_ago(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 fn pairing_section(p: &Palette, runtime: &Arc<HostRuntime>, qr: Option<&QrMatrix>) -> Div {
@@ -348,7 +558,50 @@ fn folders_section(
                 .into_any_element(),
         );
     }
+
+    #[cfg(windows)]
+    out.push(autostart_row(state, p, cx).into_any_element());
+
     out
+}
+
+#[cfg(windows)]
+fn autostart_row(state: &mut HostWindow, p: &Palette, cx: &mut Context<HostWindow>) -> AnyElement {
+    let on = state.autostart;
+    div()
+        .rounded(px(16.))
+        .bg(p.inner)
+        .px(px(14.))
+        .py(px(6.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child("Run at login"),
+        )
+        .child(
+            div()
+                .id("autostart")
+                .rounded(px(9.))
+                .bg(if on { p.button_bg } else { p.badge_bg })
+                .text_color(if on { p.button_fg } else { p.muted })
+                .px(px(10.))
+                .py(px(4.))
+                .text_size(px(11.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    win::set_autostart(!this.autostart);
+                    this.autostart = win::autostart_enabled();
+                    cx.notify();
+                }))
+                .child(if on { "On" } else { "Off" }),
+        )
+        .into_any_element()
 }
 
 fn folder_row(p: &Palette, name: &str, path: &str, cx: &mut Context<HostWindow>) -> AnyElement {
