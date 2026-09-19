@@ -1,7 +1,6 @@
 package app.nester.pair
 
 import java.net.URLDecoder
-
 data class PairingConfig(
     val host: String,
     val port: Int,
@@ -28,8 +27,8 @@ object PairingParser {
             if (part.isEmpty()) continue
             val idx = part.indexOf('=')
             if (idx <= 0) continue
-            val key = URLDecoder.decode(part.substring(0, idx), Charsets.UTF_8)
-            val value = URLDecoder.decode(part.substring(idx + 1), Charsets.UTF_8)
+            val key = urlDecode(part.substring(0, idx))
+            val value = urlDecode(part.substring(idx + 1))
             params[key] = value
         }
         val host = params["host"]?.trim().orEmpty()
@@ -42,4 +41,11 @@ object PairingParser {
         if (token.length < 16) return PairParseResult.Invalid("token too short")
         return PairParseResult.Ok(PairingConfig(host = host, port = port, token = token))
     }
+
+    private fun urlDecode(raw: String): String =
+        try {
+            URLDecoder.decode(raw, "UTF-8")
+        } catch (_: java.io.UnsupportedEncodingException) {
+            raw
+        }
 }

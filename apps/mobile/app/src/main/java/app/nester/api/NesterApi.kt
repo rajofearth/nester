@@ -74,8 +74,7 @@ class NesterApi(private val config: ApiConfig, httpClient: OkHttpClient? = null)
             .url(config.baseUrl + path)
             .header("Authorization", "Bearer $token")
 
-    private fun encodePath(path: String): String =
-        path.split('/').filter { it.isNotEmpty() }.joinToString("/") { Uri.encode(it) }
+    private fun encodePath(path: String): String = encodePathSegments(path, Uri::encode)
 
     fun health(): HealthDto {
         val req = request("/api/health", "").build()
@@ -211,3 +210,8 @@ private class StreamingRequestBody(
         }
     }
 }
+
+internal fun encodePathSegments(path: String, encode: (String) -> String): String =
+    path.split('/').joinToString("/") { segment ->
+        if (segment.isEmpty()) "" else encode(segment)
+    }
