@@ -1,0 +1,15 @@
+# Rust
+/target
+
+# Android / mobile
+apps/mobile/build/
+apps/mobile/.gradle/
+apps/mobile/.idea/
+apps/mobile/local.properties
+apps/mobile/captures/
+apps/mobile/*.iml
+
+# Secrets / tokens
+*.jks
+*.keystore
+.env

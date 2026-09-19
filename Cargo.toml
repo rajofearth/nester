@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/nester-core", "crates/nester-server", "apps/host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+blake3 = "1"
+walkdir = "2"
+notify = "8"
+notify-debouncer-full = "0.5"
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+http-body-util = "0.1"
+utoipa = { version = "5", features = ["axum_extras"] }
+rand = "0.9"
+subtle = "2"
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

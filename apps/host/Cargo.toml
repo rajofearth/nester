@@ -1,0 +1,22 @@
+[package]
+name = "nester-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "The host app: runs the sync server. GPUI window and tray land in ticket 07."
+
+[[bin]]
+name = "nester-host"
+path = "src/main.rs"
+
+[dependencies]
+nester-core = { path = "../../crates/nester-core" }
+nester-server = { path = "../../crates/nester-server" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+dirs = "6"

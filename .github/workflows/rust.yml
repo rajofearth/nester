@@ -1,0 +1,27 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "apps/host/**", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["crates/**", "apps/host/**", ".github/workflows/rust.yml"]
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+        shell: bash
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        shell: bash
+      - run: cargo test --workspace
+        shell: bash
+      - run: cargo build -p nester-host
+        shell: bash
