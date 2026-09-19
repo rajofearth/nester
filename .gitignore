@@ -13,3 +13,6 @@ apps/mobile/*.iml
 *.jks
 *.keystore
 .env
+
+# Local build artifacts
+.build-outputs/
