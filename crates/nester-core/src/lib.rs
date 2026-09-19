@@ -1,6 +1,7 @@
 pub mod hash;
 pub mod index;
 pub mod scan;
+pub mod watch;
 
 use rusqlite::Connection;
 

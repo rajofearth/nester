@@ -34,3 +34,7 @@ tempfile = "3"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }

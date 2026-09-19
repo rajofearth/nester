@@ -15,7 +15,7 @@ Index. SQLite in WAL mode, one database per folder (rusqlite). The files table h
 
 Hashing. BLAKE3, whole-file, streamed. Fast enough that no per-block scheme is needed at personal-library sizes. Fixed-size block hashes and CDC chunking are deferred; the hash column can hold them later.
 
-Uploads. tus-style: POST /uploads creates an upload, HEAD returns the offset, PATCH writes the body at an offset. Resumable, no multipart plumbing.
+Uploads. CORRECTED 2026-09-19 while implementing ticket 04: v1 ships whole-file POST to /api/folders/{id}/files/{path} with the phone's mtime in headers, streamed to a temp file while hashing, then committed; stale uploads get 409 under LWW. The tus-style session protocol (POST /uploads, HEAD offset, PATCH at offset) was deferred because resumability only matters for multi-GB uploads over flaky links, which v1 LAN photo sync does not have. Revisit if camera-video backups grow past what one POST survives.
 
 Downloads. GET with Range support, so the phone streams and resumes.
 

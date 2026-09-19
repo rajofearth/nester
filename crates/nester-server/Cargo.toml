@@ -16,11 +16,18 @@ tower.workspace = true
 tower-http.workspace = true
 tokio-util.workspace = true
 rusqlite.workspace = true
+blake3.workspace = true
 utoipa.workspace = true
 rand.workspace = true
 subtle.workspace = true
 nester-core = { path = "../nester-core" }
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
 tempfile.workspace = true
 http-body-util.workspace = true
+
+[dependencies.futures-util]
+version = "0.3"
+default-features = false
+features = ["std"]

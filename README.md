@@ -6,15 +6,14 @@ The sync model is a two-way mirror. The phone holds the full index of the host's
 
 ## v1 status
 
-What works or is in progress:
+What works now (tested):
 
-- Scan, index, and hash a folder into SQLite (nester-core)
-- HTTP server with token auth, folder and entry endpoints, downloads (nester-server)
-- Host binary that serves a folder and prints a pairing string
-- Android app: pair by QR, browse entries, download and push files
-- Watcher plus periodic rescan, thumbnails, delete/rename propagation, CI
+- Scan, index, and hash a folder into SQLite (nester-core), watcher + periodic rescan
+- HTTP server with token auth, delta pulls, Range downloads, uploads with last-writer-wins guard, deletions (nester-server)
+- Host app: GPUI window in the project's card style, QR pairing, folder add/remove, live scan status, server on a background runtime
+- Android app: QR pairing, folder browsing, delta pulls, downloads with progress, camera-roll backup with streaming uploads, file deletion both ways
 
-What is deliberately held out until later: accounts, RevenueCat billing, Tailscale/remote access, iOS, Linux host, share-out URLs, video streaming, version vectors, CDC chunking. See docs/v1-scope.md.
+Still open: thumbnails (ticket 08), tray icon, explicit renames, upload resume. Held out until later: accounts, RevenueCat billing, Tailscale/remote access, iOS, Linux host, share-out URLs, video streaming, version vectors, CDC chunking. See docs/v1-scope.md.
 
 ## Repo layout
 

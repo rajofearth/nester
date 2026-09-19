@@ -1,11 +1,22 @@
+mod config;
+mod theme;
+mod ui;
+mod win;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use base64::Engine;
 use clap::Parser;
 use nester_core::Folder;
 use nester_server::state::AppState;
+
+use config::Config;
 
 #[derive(Parser)]
 #[command(
@@ -13,18 +24,47 @@ use nester_server::state::AppState;
     about = "Nester host: syncs folders to your phone over WiFi"
 )]
 struct Args {
-    /// Folders to sync. Repeat for multiple.
-    #[arg(long = "folder", required = true)]
+    /// Folders to sync. Repeat for multiple. Overrides config.toml.
+    #[arg(long = "folder")]
     folders: Vec<std::path::PathBuf>,
-    #[arg(long, default_value_t = 7300)]
-    port: u16,
-    /// Where the pairing token and per-folder indexes live.
+    /// Overrides config.toml.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Where the pairing token, config, and per-folder indexes live.
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
+    /// Run the server without the GPUI window.
+    #[arg(long)]
+    headless: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub struct HostRuntime {
+    pub ip: Option<IpAddr>,
+    pub port: u16,
+    pub pairing_token: String,
+    pub config_path: PathBuf,
+    pub config: Mutex<Config>,
+    pub folders: Mutex<Vec<Folder>>,
+    pub last_scan: Mutex<Option<ui::ScanLog>>,
+    pub pending_restart: AtomicBool,
+}
+
+impl HostRuntime {
+    pub fn pairing_payload(&self) -> String {
+        match self.ip {
+            Some(ip) => format!(
+                "nester://pair?host={ip}&port={}&token={}",
+                self.port, self.pairing_token
+            ),
+            None => format!(
+                "nester://pair?host=MISSING&port={}&token={}",
+                self.port, self.pairing_token
+            ),
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -35,11 +75,29 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(data_dir.join("index"))?;
+    let config_path = Config::data_path(&data_dir);
+    let mut config = Config::load(&config_path).unwrap_or_default();
+    let port = args
+        .port
+        .or(if config.port > 0 {
+            Some(config.port)
+        } else {
+            None
+        })
+        .unwrap_or(7300);
+    config.port = port;
+
+    let folder_paths: Vec<PathBuf> = if args.folders.is_empty() {
+        config.folders.iter().map(PathBuf::from).collect()
+    } else {
+        args.folders.clone()
+    };
+
     let token = load_or_create_token(&data_dir)?;
 
     let mut folders = Vec::new();
     let mut dbs = HashMap::new();
-    for path in &args.folders {
+    for path in &folder_paths {
         let canonical = path.canonicalize()?;
         let id = nester_core::folder_id(&canonical);
         let db_path = data_dir.join("index").join(format!("{id}.db"));
@@ -64,27 +122,114 @@ async fn main() -> anyhow::Result<()> {
             root: canonical,
         });
     }
+    config.folders = folders
+        .iter()
+        .map(|f| f.root.to_string_lossy().into_owned())
+        .collect();
+    config.save(&config_path)?;
 
-    let state = AppState::new(folders.clone(), dbs, token.clone());
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let runtime = Arc::new(HostRuntime {
+        ip: local_ip(),
+        port,
+        pairing_token: token.clone(),
+        config_path: config_path.clone(),
+        config: Mutex::new(config),
+        folders: Mutex::new(folders.clone()),
+        last_scan: Mutex::new(None),
+        pending_restart: AtomicBool::new(false),
+    });
 
-    // Pairing payload the phone's QR scanner consumes.
-    if let Some(ip) = local_ip() {
-        println!("Scan this with the Nester app, or open the URL on your phone:");
-        println!("  nester://pair?host={ip}&port={}&token={token}", args.port);
-        println!("  http://{ip}:{}/api/health", args.port);
-    } else {
-        println!("Could not detect LAN IP; phone must target this machine manually.");
+    let server_runtime = Arc::clone(&runtime);
+    let server_folders = folders.clone();
+    let server_dbs = dbs.clone();
+    let server_token = token.clone();
+    std::thread::Builder::new()
+        .name("nester-server".into())
+        .spawn(move || -> anyhow::Result<()> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                let watchers = start_rescans(&server_runtime, &server_folders, &server_dbs)?;
+                let state = AppState::new(server_folders, server_dbs, server_token);
+                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+                let listener = tokio::net::TcpListener::bind(addr).await?;
+                tracing::info!("serving on {addr}");
+                nester_server::serve(listener, state).await?;
+                drop(watchers);
+                anyhow::Ok(())
+            })?;
+            anyhow::Ok(())
+        })?;
+
+    if args.headless {
+        let payload = runtime.pairing_payload();
+        println!("{payload}");
+        println!("Nester host running headless. Ctrl-C to stop.");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
     }
-    println!("Pairing token: {token}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("serving {} folder(s) on {addr}", folders.len());
-    tokio::select! {
-        result = nester_server::serve(listener, state) => result?,
-        _ = shutdown_signal() => tracing::info!("shutting down"),
-    }
+    gpui_platform::application().run(move |cx: &mut gpui::App| {
+        ui::HostWindow::open(cx, runtime.clone());
+    });
+
     Ok(())
+}
+
+fn start_rescans(
+    runtime: &Arc<HostRuntime>,
+    folders: &[Folder],
+    dbs: &HashMap<String, Arc<Mutex<rusqlite::Connection>>>,
+) -> anyhow::Result<Vec<nester_core::watch::FolderWatcher>> {
+    let mut watchers = Vec::new();
+    for folder in folders {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        watchers.push(nester_core::watch::FolderWatcher::start(
+            &folder.root,
+            Duration::from_secs(2),
+            tx.clone(),
+        )?);
+
+        let tx_periodic = tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let _ = tx_periodic.send(());
+            }
+        });
+
+        let root = folder.root.clone();
+        let label = folder.label.clone();
+        let db = dbs[&folder.id].clone();
+        let runtime = Arc::clone(runtime);
+        tokio::task::spawn_blocking(move || {
+            while rx.recv().is_ok() {
+                while rx.try_recv().is_ok() {}
+                let mut conn = db.lock().unwrap();
+                match nester_core::scan::scan_folder(&mut conn, &root) {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "rescan {label}: {} added, {} updated, {} removed",
+                            stats.added,
+                            stats.updated,
+                            stats.removed
+                        );
+                        *runtime.last_scan.lock().unwrap() = Some(ui::ScanLog {
+                            label: label.clone(),
+                            stats,
+                        });
+                    }
+                    Err(e) => tracing::error!("rescan {label} failed: {e}"),
+                }
+            }
+        });
+    }
+    Ok(watchers)
 }
 
 fn default_data_dir() -> std::path::PathBuf {
@@ -94,7 +239,7 @@ fn default_data_dir() -> std::path::PathBuf {
 }
 
 /// The pairing token survives restarts so the phone only pairs once. Printed
-/// to stdout because the headless path has no QR window yet (ticket 07).
+/// to stdout because the headless path has no QR window.
 fn load_or_create_token(data_dir: &std::path::Path) -> anyhow::Result<String> {
     let path = data_dir.join("pairing-token");
     if let Ok(existing) = std::fs::read_to_string(&path) {
@@ -119,9 +264,4 @@ fn local_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|a| a.ip())
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutting down");
 }

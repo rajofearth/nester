@@ -69,7 +69,7 @@ pub fn scan_folder(conn: &mut Connection, root: &Path) -> anyhow::Result<ScanSta
 
         let (mtime_s, mtime_ns) = unix_mtime(meta.modified()?);
 
-        if let Some(known) = get_entry(&tx, &rel)?
+        if let Some(known) = get_entry_tx(&tx, &rel)?
             && !known.deleted
             && known.kind == EntryKind::File
             && known.size == meta.len()
@@ -161,7 +161,7 @@ fn upsert_entry(
     Ok(())
 }
 
-fn get_entry(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<Option<FileEntry>> {
+fn get_entry_tx(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<Option<FileEntry>> {
     let mut stmt = tx.prepare(
         "SELECT path, kind, size, mtime_s, mtime_ns, deleted, hash, sequence FROM files WHERE path = ?1",
     )?;
@@ -198,6 +198,38 @@ pub fn entries_since(conn: &Connection, since: i64) -> anyhow::Result<Vec<FileEn
     )?;
     let rows = stmt.query_map([since], row_to_entry)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Index lookup by relative path.
+pub fn get_entry(conn: &Connection, path: &str) -> anyhow::Result<Option<FileEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, kind, size, mtime_s, mtime_ns, deleted, hash, sequence FROM files WHERE path = ?1",
+    )?;
+    let mut rows = stmt.query_map([path], row_to_entry)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// Apply one change that originated on the phone: upsert or mark deleted, with
+/// a fresh sequence number so the next delta pull picks it up.
+pub fn apply_file_change(conn: &mut Connection, entry: &FileEntry) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    upsert_entry(&tx, entry, &mut ScanStats::default())?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Mark an entry deleted in the index (the file itself is handled by the caller).
+pub fn mark_deleted(conn: &mut Connection, path: &str) -> anyhow::Result<bool> {
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE files SET deleted = 1, hash = NULL, sequence = (SELECT COALESCE(MAX(sequence), 0) + 1 FROM files) WHERE path = ?1 AND deleted = 0",
+        [path],
+    )?;
+    tx.commit()?;
+    Ok(changed > 0)
 }
 
 fn unix_mtime(mtime: std::time::SystemTime) -> (i64, i64) {
