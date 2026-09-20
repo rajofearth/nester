@@ -37,6 +37,12 @@ The sync model. Device and host converge on the same set of entries; changes on 
 On-demand content
 The phone holds the full index but downloads file bodies only when opened or pinned. Thumbnails come down with the index.
 
+Backed up
+For items the phone created (camera uploads): the body was uploaded to the host and the phone's bookkeeping recorded it. Shown as "Backed up" on camera screens; "Synced" in folder grids.
+
+Synced / Not synced (device chip)
+In a folder grid, "Synced" means the file body is on this phone (downloaded on demand); "Not synced" means the index knows the entry but the body is still on the host only. Downloads are always explicit (tap a tile to get a detail sheet with a Download action).
+
 LRU eviction
 When local content storage passes its budget, the phone deletes the least recently used file bodies. The index rows stay; contents can be re-downloaded.
 
