@@ -182,7 +182,7 @@ impl HostRuntime {
             .lock()
             .unwrap()
             .iter()
-            .map(|f| (f.label.clone(), f.root.to_string_lossy().into_owned()))
+            .map(|f| (f.label.clone(), nester_core::display_root(&f.root)))
             .collect()
     }
 

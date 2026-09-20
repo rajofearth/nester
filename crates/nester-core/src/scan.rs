@@ -6,6 +6,12 @@ use walkdir::WalkDir;
 use crate::hash::hash_file;
 use crate::{EntryKind, FileEntry};
 
+/// True if any path component is the host's upload-staging dir. Those entries
+/// are infrastructure: never indexed, never listed.
+pub fn is_tmp_path(rel: &str) -> bool {
+    rel.split('/').any(|seg| seg == crate::TMP_DIR)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScanStats {
     pub added: u64,
@@ -40,6 +46,9 @@ pub fn scan_folder(conn: &mut Connection, root: &Path) -> anyhow::Result<ScanSta
             .to_string_lossy()
             .replace('\\', "/");
         if rel.is_empty() {
+            continue;
+        }
+        if is_tmp_path(&rel) {
             continue;
         }
         seen.push(rel.clone());
@@ -192,11 +201,15 @@ pub(crate) fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry>
     })
 }
 
-/// Entries with `sequence > since`, oldest change first. The phone's delta pull.
+/// Entries with `sequence > since`, oldest change first. The phone's delta
+/// pull. Upload-staging entries are hidden while they exist; their deletions
+/// still propagate so devices that already hold them can purge.
 pub fn entries_since(conn: &Connection, since: i64) -> anyhow::Result<Vec<FileEntry>> {
     let mut stmt = conn.prepare(
         "SELECT path, kind, size, mtime_s, mtime_ns, deleted, hash, sequence
-         FROM files WHERE sequence > ?1 ORDER BY sequence ASC",
+         FROM files WHERE sequence > ?1
+           AND (deleted = 1 OR instr('/' || path || '/', '/.nester-tmp/') = 0)
+         ORDER BY sequence ASC",
     )?;
     let rows = stmt.query_map([since], row_to_entry)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -391,5 +404,62 @@ mod tests {
         assert_eq!(stats.updated, 1);
         let a = get_entry(&conn, "a.txt").unwrap().unwrap();
         assert_eq!(a.mtime_s, base + 3);
+    }
+
+    #[test]
+    fn scan_skips_upload_staging_dir() {
+        let root = crate::test_root("scan-tmp-dir");
+        let db = root.parent().unwrap().join(format!(
+            "{}.db",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(root.join("keep.txt"), b"hi").unwrap();
+        std::fs::create_dir(root.join(crate::TMP_DIR)).unwrap();
+        std::fs::write(root.join(crate::TMP_DIR).join("upload-1"), b"staging").unwrap();
+
+        let mut conn = open_db(&db).unwrap();
+        let stats = scan_folder(&mut conn, &root).unwrap();
+        assert_eq!(stats.updated, 1);
+        assert_eq!(stats.added, 0);
+        let entries = entries_since(&conn, 0).unwrap();
+        assert!(entries.iter().all(|e| !is_tmp_path(&e.path)));
+    }
+
+    #[test]
+    fn staging_rows_purge_via_delta_pull() {
+        let root = crate::test_root("scan-tmp-purge");
+        let db = root.parent().unwrap().join(format!(
+            "{}.db",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(root.join("keep.txt"), b"hi").unwrap();
+        let mut conn = open_db(&db).unwrap();
+        scan_folder(&mut conn, &root).unwrap();
+
+        // Simulate an older index that had already recorded a staging entry.
+        apply_file_change(
+            &mut conn,
+            &FileEntry {
+                path: format!("{}/upload-1", crate::TMP_DIR),
+                kind: EntryKind::File,
+                size: 7,
+                mtime_s: 0,
+                mtime_ns: 0,
+                deleted: false,
+                hash: None,
+                sequence: 0,
+            },
+        )
+        .unwrap();
+
+        // The next scan marks it missing; the deletion still reaches devices.
+        let stats = scan_folder(&mut conn, &root).unwrap();
+        assert_eq!(stats.removed, 1);
+        let entries = entries_since(&conn, 0).unwrap();
+        let gone = entries
+            .iter()
+            .find(|e| e.path == format!("{}/upload-1", crate::TMP_DIR))
+            .unwrap();
+        assert!(gone.deleted);
     }
 }

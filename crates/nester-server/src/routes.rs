@@ -102,7 +102,12 @@ pub async fn list_folders(State(state): State<AppState>) -> Json<FoldersResponse
         .folders
         .iter()
         .map(|f| FolderWithStats {
-            folder: f.clone(),
+            folder: Folder {
+                // Display only: strip the Win32 extended-length prefix. The
+                // canonical path stays authoritative for IO and folder ids.
+                root: std::path::PathBuf::from(nester_core::display_root(&f.root)),
+                ..f.clone()
+            },
             stats: folder_stats(&state, &f.id),
         })
         .collect();
@@ -321,7 +326,8 @@ pub fn safe_join(root: &std::path::Path, rel: &str) -> Option<PathBuf> {
 /// Windows-host guard over the DECODED relative path: names must survive
 /// landing on NTFS/Win32. Rejects reserved chars, control chars, dot/space
 /// endings, empty segments, and oversized paths. Runs before `safe_join`, on
-/// every handler that takes a file path.
+/// every handler that takes a file path. The host's upload-staging dir is
+/// infrastructure, so it is not reachable over the API either.
 fn valid_rel_path(rel: &str) -> bool {
     if rel.len() > 240 {
         return false;
@@ -332,7 +338,7 @@ fn valid_rel_path(rel: &str) -> bool {
             && !seg.ends_with(' ')
             && !seg.bytes().any(|b| b < 0x20 || b == 0x7f)
             && !seg.contains(['<', '>', ':', '"', '|', '?', '*'])
-    })
+    }) && !nester_core::scan::is_tmp_path(rel)
 }
 
 /// Log-only: flag uploads whose name collides with an existing entry that
