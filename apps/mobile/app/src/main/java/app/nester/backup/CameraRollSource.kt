@@ -10,10 +10,12 @@ object CameraRollSource {
 
     private const val MAX_ITEMS = 5000
 
-    fun query(context: Context): List<MediaItem> {
+    fun query(context: Context, includeVideos: Boolean = true): List<MediaItem> {
         val items = mutableListOf<MediaItem>()
         items += queryCollection(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, isVideo = false)
-        items += queryCollection(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI, isVideo = true)
+        if (includeVideos) {
+            items += queryCollection(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI, isVideo = true)
+        }
         return items.sortedByDescending { it.dateModifiedS }.take(MAX_ITEMS)
     }
 

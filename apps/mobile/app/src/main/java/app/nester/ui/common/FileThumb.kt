@@ -14,13 +14,17 @@ import androidx.compose.ui.unit.dp
 import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.VideoFrameDecoder
+import coil.memory.MemoryCache
 import java.io.File
 
 @Composable
 fun rememberMediaImageLoader(): ImageLoader {
     val context = androidx.compose.ui.platform.LocalContext.current
     return remember(context) {
-        ImageLoader.Builder(context).components { add(VideoFrameDecoder.Factory()) }.build()
+        ImageLoader.Builder(context)
+            .components { add(VideoFrameDecoder.Factory()) }
+            .memoryCache(MemoryCache.Builder(context).maxSizePercent(0.30).build())
+            .build()
     }
 }
 
