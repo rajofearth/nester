@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -64,9 +65,11 @@ import app.nester.backup.ItemStatus
 import app.nester.backup.MediaItem
 import app.nester.backup.TransferRateTracker
 import app.nester.backup.etaSeconds
+import app.nester.backup.backupEndStateHeadline
 import app.nester.backup.groupFailures
 import app.nester.backup.notBackedUpSummaryText
 import app.nester.backup.planBackup
+import app.nester.backup.processedCount
 import app.nester.store.NesterStore
 import app.nester.ui.common.formatDuration
 import app.nester.ui.common.formatEta
@@ -211,6 +214,8 @@ fun CameraRollScreen(
                         }
                     }
                     statuses = statuses + (id to ItemStatus.DONE)
+                    sentBefore += pi.item.size
+                    run = run?.copy(sentBytes = sentBefore)
                     val now = System.currentTimeMillis()
                     uploaded = uploaded + (id to now)
                     selected = selected - id
@@ -223,12 +228,9 @@ fun CameraRollScreen(
                 } catch (e: Exception) {
                     statuses = statuses + (id to ItemStatus.FAILED)
                     failures = failures + BackupFailure(id, e.message ?: "unknown error")
-                } finally {
-                    sentBefore += pi.item.size
-                    run = run?.copy(sentBytes = sentBefore)
                 }
             }
-            run = run?.copy(phase = BackupPhase.DONE, endedMs = System.currentTimeMillis(), sentBytes = totalBytes)
+            run = run?.copy(phase = BackupPhase.DONE, endedMs = System.currentTimeMillis(), sentBytes = sentBefore)
         }
     }
 
@@ -277,10 +279,14 @@ fun CameraRollScreen(
                 val pendingItems = list.filter { it.mediaStoreId !in uploaded }
                 val runActive = run != null && run?.phase != BackupPhase.DONE
                 val doneInPlan = run?.planIds?.count { statuses[it] == ItemStatus.DONE } ?: 0
+                val failedInPlan = run?.planIds?.count { statuses[it] == ItemStatus.FAILED } ?: 0
+                val conflictInPlan = run?.planIds?.count { statuses[it] == ItemStatus.CONFLICT } ?: 0
 
                 BackupStateCard(
                     run = run,
                     doneInPlan = doneInPlan,
+                    failedInPlan = failedInPlan,
+                    conflictInPlan = conflictInPlan,
                     pendingCount = pendingItems.size,
                     pendingBytes = pendingItems.sumOf { it.size },
                 )
@@ -376,9 +382,14 @@ fun CameraRollScreen(
 private fun BackupStateCard(
     run: BackupRun?,
     doneInPlan: Int,
+    failedInPlan: Int,
+    conflictInPlan: Int,
     pendingCount: Int,
     pendingBytes: Long,
 ) {
+    // Processed = uploaded + skipped + failed, so a run that dies at item 1
+    // reports "1 of K processed" instead of pretending the bar is the truth.
+    val processedInPlan = processedCount(doneInPlan, conflictInPlan, failedInPlan)
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(12.dp),
@@ -412,30 +423,47 @@ private fun BackupStateCard(
                     }
                 }
                 run.phase == BackupPhase.DONE -> {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Filled.CheckCircle,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Text(
-                            "Backup complete",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(start = Spacing.s),
-                        )
+                    if (failedInPlan > 0 || conflictInPlan > 0) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Filled.Warning,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                backupEndStateHeadline(doneInPlan, run.planIds.size, conflictInPlan, failedInPlan),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(start = Spacing.s),
+                            )
+                        }
+                    } else {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Filled.CheckCircle,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                "Backup complete",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(start = Spacing.s),
+                            )
+                        }
                     }
                 }
                 run.phase == BackupPhase.PAUSED -> {
                     Text(
-                        "Paused - ${doneInPlan + 1} of ${run.planIds.size} items (${formatSize(run.totalBytes - run.sentBytes)} left)",
+                        "Paused - ${processedInPlan + 1} of ${run.planIds.size} items (${formatSize(run.totalBytes - run.sentBytes)} left)",
                         style = MaterialTheme.typography.titleSmall,
                     )
                 }
                 run.phase == BackupPhase.RUNNING -> {
                     Text(
-                        "Backing up - ${doneInPlan + 1} of ${run.planIds.size} items (${formatSize(run.totalBytes - run.sentBytes)} left)",
+                        "Backing up - ${(processedInPlan + 1).coerceAtMost(run.planIds.size)} of ${run.planIds.size} items (${formatSize(run.totalBytes - run.sentBytes)} left)",
                         style = MaterialTheme.typography.titleSmall,
                     )
                 }

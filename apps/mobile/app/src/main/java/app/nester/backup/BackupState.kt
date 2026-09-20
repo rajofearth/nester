@@ -57,3 +57,12 @@ fun groupFailures(messages: List<String>): List<FailureGroup> =
 
 fun notBackedUpSummaryText(count: Long, bytes: Long): String =
     "Not backed up: %,d items (%s)".format(count, app.nester.ui.common.formatSize(bytes))
+
+fun processedCount(done: Int, skipped: Int, failed: Int): Int = done + skipped + failed
+
+fun backupEndStateHeadline(done: Int, planned: Int, skipped: Int, failed: Int): String =
+    buildString {
+        append("Finished - $done of $planned backed up")
+        if (skipped > 0) append(" · $skipped skipped")
+        if (failed > 0) append(" · $failed failed")
+    }
